@@ -1,94 +1,43 @@
-#define LED_PIN 48
-#define SDA_PIN GPIO_NUM_21
-#define SCL_PIN GPIO_NUM_22
+#define RELAY_PIN 4
+#define SDA_PIN 21
+#define SCL_PIN 22
 
 #include <WiFi.h>
 #include <Arduino_MQTT_Client.h>
 #include <ThingsBoard.h>
-#include "DHT20.h"
-#include "Wire.h"
-#include <ArduinoOTA.h>
-
+#include <Wire.h>
+#include <MFRC522.h>
+#include <SPI.h>
+#include "OTA_Update_Callback.h"
 constexpr char WIFI_SSID[] = "iPhone";
 constexpr char WIFI_PASSWORD[] = "07072004";
 
-constexpr char TOKEN[] = "g14piik3js3eq55lkbf2";
+constexpr char TOKEN[] = "HFzicWqo8stiFQG6006k";
 constexpr char THINGSBOARD_SERVER[] = "app.coreiot.io";
 constexpr uint16_t THINGSBOARD_PORT = 1883U;
+
+constexpr char CURRENT_FIRMWARE_TITLE[] = "ESP32_Firmware";
+constexpr char CURRENT_FIRMWARE_VERSION[] = "1.0.0";
 
 constexpr uint32_t MAX_MESSAGE_SIZE = 1024U;
 constexpr uint32_t SERIAL_DEBUG_BAUD = 115200U;
 
-constexpr char BLINKING_INTERVAL_ATTR[] = "blinkingInterval";
-constexpr char LED_MODE_ATTR[] = "ledMode";
-constexpr char LED_STATE_ATTR[] = "ledState";
-
-volatile bool attributesChanged = false;
-volatile int ledMode = 0;
-volatile bool ledState = false;
-
-constexpr uint16_t BLINKING_INTERVAL_MS_MIN = 10U;
-constexpr uint16_t BLINKING_INTERVAL_MS_MAX = 60000U;
-volatile uint16_t blinkingInterval = 1000U;
-
-uint32_t previousStateChange;
-
-constexpr int16_t telemetrySendInterval = 10000U;
-uint32_t previousDataSend;
-
-constexpr std::array<const char *, 2U> SHARED_ATTRIBUTES_LIST = {
-  LED_STATE_ATTR,
-  BLINKING_INTERVAL_ATTR
-};
-
+#define SS_PIN 5
+#define RST_PIN 2
+MFRC522 rfid(SS_PIN, RST_PIN);
 
 WiFiClient wifiClient;
 Arduino_MQTT_Client mqttClient(wifiClient);
-ThingsBoard tb(mqttClient, MAX_MESSAGE_SIZE);
-DHT20 dht20;
-
-// RPC_Response setLedSwitchState(const RPC_Data &data) {
-//   Serial.println("Received Switch state");
-//   bool newState = data;
-//   Serial.print("Switch state change: ");
-//   Serial.println(newState);
-//   digitalWrite(LED_PIN, newState);
-//   attributesChanged = true;
-//   return RPC_Response("setLedSwitchValue", newState);
-// }
-
-// const std::array<RPC_Callback, 1U> callbacks = {
-// RPC_Callback{ "setLedSwitchValue", setLedSwitchState }
-// };
-
-// void processSharedAttributes(const Shared_Attribute_Data &data) {
-// for (auto it = data.begin(); it != data.end(); ++it) {
-//   if (strcmp(it->key().c_str(), BLINKING_INTERVAL_ATTR) == 0) {
-//     const uint16_t new_interval = it->value().as<uint16_t>();
-//     if (new_interval >= BLINKING_INTERVAL_MS_MIN && new_interval <= BLINKING_INTERVAL_MS_MAX) {
-//       blinkingInterval = new_interval;
-//       Serial.print("Blinking interval is set to: ");
-//       Serial.println(new_interval);
-//     }
-//   } else if (strcmp(it->key().c_str(), LED_STATE_ATTR) == 0) {
-//     ledState = it->value().as<bool>();
-//     digitalWrite(LED_PIN, ledState);
-//     Serial.print("LED state is set to: ");
-//     Serial.println(ledState);
-//   }
-// }
-// attributesChanged = true;
-// }
-
-// const Shared_Attribute_Callback attributes_callback(&processSharedAttributes, SHARED_ATTRIBUTES_LIST.cbegin(), SHARED_ATTRIBUTES_LIST.cend());
-// const Attribute_Request_Callback attribute_shared_request_callback(&processSharedAttributes, SHARED_ATTRIBUTES_LIST.cbegin(), SHARED_ATTRIBUTES_LIST.cend());
+ThingsBoardSized<8, 2, 5, 1> tb(mqttClient, MAX_MESSAGE_SIZE);
+OTA_Update_Callback ota;
+float voltage = 0.0;
+float current = 0.0;
+float power = 0.0;
 
 void InitWiFi() {
   Serial.println("Connecting to AP ...");
-  // Attempting to establish a connection to the given WiFi network
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   while (WiFi.status() != WL_CONNECTED) {
-    // Delay 500ms until a connection has been successfully established
     vTaskDelay(pdMS_TO_TICKS(500));
     Serial.print(".");
   }
@@ -96,32 +45,28 @@ void InitWiFi() {
 }
 
 const bool reconnect() {
-  // Check to ensure we aren't connected yet
   const wl_status_t status = WiFi.status();
   if (status == WL_CONNECTED) {
     return true;
   }
-  // If we aren't establish a new connection to the given WiFi network
   InitWiFi();
   return true;
 }
+
 TaskHandle_t wifiTaskHandle;
 TaskHandle_t tbTaskHandle;
-TaskHandle_t TaskDHT20Handle;
-TaskHandle_t TaskLEDHandle;
-TaskHandle_t TaskSendAttributeHandle;
+TaskHandle_t rfidTaskHandle;
+SemaphoreHandle_t acDataMutex;
 
-// --------------------------- Task: Kết nối WiFi ---------------------------
 void connectwf(void *parameter) {
   while (1) {
     if(!reconnect()){
       return;
     }
-    vTaskDelay(pdMS_TO_TICKS(10000));  // Kiểm tra lại mỗi 10 giây
+    vTaskDelay(pdMS_TO_TICKS(10000));
   }
 }
 
-// --------------------------- Task: Kết nối ThingsBoard ---------------------------
 void connectTB(void *parameter) {
   while (1) {
     if(WiFi.status() == WL_CONNECTED){
@@ -130,102 +75,131 @@ void connectTB(void *parameter) {
         Serial.print(THINGSBOARD_SERVER);
         Serial.print(" with token ");
         Serial.println(TOKEN);
+        if(!tb.connect(THINGSBOARD_SERVER, TOKEN, THINGSBOARD_PORT)) {
+          Serial.println("Failed to connect");
+        } else {
+          Serial.println("Connected!");
+          tb.sendAttributeData("macAddress", WiFi.macAddress().c_str());
+          ota.Set_Firmware_Title(CURRENT_FIRMWARE_TITLE);
+          ota.Set_Firmware_Version(CURRENT_FIRMWARE_VERSION);
+          tb.Firmware_Send_Info(CURRENT_FIRMWARE_TITLE, CURRENT_FIRMWARE_VERSION);
+          tb.Subscribe_Firmware_Update(ota);
+        }
       }
-      if(!tb.connect(THINGSBOARD_SERVER, TOKEN, THINGSBOARD_PORT)) {
-        Serial.println("Failed to connect");
-      } 
-      // else {
-      //   Serial.println("Connected !");
-      //   tb.sendAttributeData("macAddress", WiFi.macAddress().c_str());
-
-      //   Serial.println("Subscribing for RPC...");
-      //   if (!tb.RPC_Subscribe(callbacks.cbegin(), callbacks.cend())) {
-      //     Serial.println("Failed to subscribe for RPC");
-      //     return;
-      //   }
-
-      //   if (!tb.Shared_Attributes_Subscribe(attributes_callback)) {
-      //     Serial.println("Failed to subscribe for shared attribute updates");
-      //     return;
-      //   }
-
-      //   Serial.println("Subscribe done");
-
-      //   if (!tb.Shared_Attributes_Request(attribute_shared_request_callback)) {
-      //     Serial.println("Failed to request for shared attributes");
-      //     return;
-      //   }
-      // }
     }
-    vTaskDelay(pdMS_TO_TICKS(5000));  // Kiểm tra kết nối mỗi 5 giây
+    vTaskDelay(pdMS_TO_TICKS(5000));
   }
 }
 
-// --------------------------- Task: Đọc cảm biến DHT20 ---------------------------
-void taskDHT20Sensor(void *parameter) {
-  while (1) {
-    dht20.read();
-    float temperature = dht20.getTemperature();
-    float humidity = dht20.getHumidity();
+String getUIDString() {
+  String uid = "";
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    uid += String(rfid.uid.uidByte[i] < 0x10 ? "0" : "");
+    uid += String(rfid.uid.uidByte[i], HEX);
+  }
+  uid.toUpperCase();
+  return uid;
+}
 
-    if (!isnan(temperature) && !isnan(humidity)) {
-      Serial.printf("Temperture: %.2f°C, Humidity: %.2f%%\n", temperature, humidity);
-      tb.sendTelemetryData("temperature", temperature);
-      tb.sendTelemetryData("humidity", humidity);
+void taskRFID(void *parameter) {
+  while (1) {
+    if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) {
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+
+    String uid = getUIDString();
+    Serial.print("Detected RFID UID: ");
+    Serial.println(uid);
+
+    // Kiểm tra UID hợp lệ (có thể thay bằng danh sách UID động)
+    if (uid == "12345678") {
+      digitalWrite(RELAY_PIN, HIGH);
+      Serial.println("Relay ON");
+      tb.sendTelemetryData("relay", true);
     } else {
-      Serial.println("Lỗi đọc cảm biến DHT20!");
+      digitalWrite(RELAY_PIN, LOW);
+      Serial.println("Relay OFF");
+      tb.sendTelemetryData("relay", false);
     }
 
-    vTaskDelay(pdMS_TO_TICKS(2000));  // Đọc mỗi 2 giây
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+    vTaskDelay(pdMS_TO_TICKS(2000));
   }
 }
 
-// --------------------------- Task: Điều khiển LED ---------------------------
-void taskLEDBlink(void *parameter) {
+void taskACMeasure(void *parameter) {
   while (1) {
-    if (attributesChanged) {
-      attributesChanged = false;
-      tb.sendAttributeData(LED_STATE_ATTR, digitalRead(LED_PIN));
+    Wire.beginTransmission(0x50);  // HLW8032 default I2C addr
+    Wire.write(0x00);
+    Wire.endTransmission(false);
+    Wire.requestFrom(0x50, 24);
+
+    if (Wire.available() == 24) {
+      byte buffer[24];
+      for (int i = 0; i < 24; i++) {
+        buffer[i] = Wire.read();
+      }
+
+      uint32_t voltage_raw = (buffer[4] << 16) | (buffer[5] << 8) | buffer[6];
+      uint32_t current_raw = (buffer[7] << 16) | (buffer[8] << 8) | buffer[9];
+      uint32_t power_raw   = (buffer[10] << 16) | (buffer[11] << 8) | buffer[12];
+
+      float new_voltage = voltage_raw / 100.0;
+      float new_current = current_raw / 1000.0;
+      float new_power   = power_raw / 100.0;
+
+      if (xSemaphoreTake(acDataMutex, pdMS_TO_TICKS(100))) {
+        voltage = new_voltage;
+        current = new_current;
+        power = new_power;
+        xSemaphoreGive(acDataMutex);
+      }
     }
-    if (ledMode == 1) {  // Kiểm tra trước khi thay đổi trạng thái LED
-      ledState = !ledState;
-      digitalWrite(LED_PIN, ledState);
-      Serial.printf("LED state: %d\n", ledState);
-      tb.sendAttributeData("ledState", ledState);
-    }
-    vTaskDelay(pdMS_TO_TICKS(blinkingInterval));
+
+    vTaskDelay(pdMS_TO_TICKS(3000));  // 3s
   }
 }
 
-// --------------------------- Task: Gửi Attribute Data ---------------------------
-void taskSendAttributeData(void *parameter) {
+void taskSendACData(void *parameter) {
   while (1) {
     if (tb.connected()) {
-      tb.sendAttributeData("rssi", WiFi.RSSI());
-      tb.sendAttributeData("channel", WiFi.channel());
-      tb.sendAttributeData("bssid", WiFi.BSSIDstr().c_str());
-      tb.sendAttributeData("localIp", WiFi.localIP().toString().c_str());
-      tb.sendAttributeData("ssid", WiFi.SSID().c_str());
+      float v, c, p;
+      if (xSemaphoreTake(acDataMutex, pdMS_TO_TICKS(100))) {
+        v = voltage;
+        c = current;
+        p = power;
+        xSemaphoreGive(acDataMutex);
+      }
+
+      tb.sendTelemetryData("voltage", v);
+      tb.sendTelemetryData("current", c);
+      tb.sendTelemetryData("power", p);
     }
-    vTaskDelay(pdMS_TO_TICKS(2000));  // Gửi mỗi 22 giây
+
+    vTaskDelay(pdMS_TO_TICKS(5000));  // mỗi 5s gửi 1 lần
   }
 }
 
-// --------------------------- Setup ---------------------------
+
 void setup() {
   Serial.begin(SERIAL_DEBUG_BAUD);
-  pinMode(LED_PIN, OUTPUT);
-  InitWiFi();
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);
+
+  SPI.begin();
+  rfid.PCD_Init();
+  Serial.println("RFID Ready");
   Wire.begin(SDA_PIN, SCL_PIN);
-  dht20.begin();
-  
-  // Tạo các Task của FreeRTOS
+  acDataMutex = xSemaphoreCreateMutex();
+  InitWiFi();
+
   xTaskCreatePinnedToCore(connectwf, "WiFi Task", 4096, NULL, 1, &wifiTaskHandle, 1);
   xTaskCreatePinnedToCore(connectTB, "TB Task", 4096, NULL, 1, &tbTaskHandle, 1);
-  xTaskCreatePinnedToCore(taskDHT20Sensor, "DHT20 Task", 4096, NULL, 1, &TaskDHT20Handle, 1);
-  xTaskCreatePinnedToCore(taskLEDBlink, "LED Blink Task", 2048, NULL, 1, &TaskLEDHandle, 0);
-  xTaskCreatePinnedToCore(taskSendAttributeData, "Attribute Task", 4096, NULL, 1, &TaskSendAttributeHandle, 1);
+  xTaskCreatePinnedToCore(taskRFID, "RFID Task", 4096, NULL, 1, &rfidTaskHandle, 1);
+  xTaskCreatePinnedToCore(taskACMeasure, "AC Read Task", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(taskSendACData, "Send AC Task", 4096, NULL, 1, NULL, 1);
 }
 
-void loop() {
-}
+void loop() {} 
