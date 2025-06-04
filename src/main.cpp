@@ -22,8 +22,8 @@ constexpr char CURRENT_FIRMWARE_VERSION[] = "1.0.0";
 constexpr uint32_t MAX_MESSAGE_SIZE = 1024U;
 constexpr uint32_t SERIAL_DEBUG_BAUD = 115200U;
 
-#define SS_PIN 5
-#define RST_PIN 2
+#define SS_PIN 10
+#define RST_PIN 9
 MFRC522 rfid(SS_PIN, RST_PIN);
 
 WiFiClient wifiClient;
