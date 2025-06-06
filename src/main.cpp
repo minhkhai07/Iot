@@ -1,4 +1,4 @@
-#define RELAY_PIN 4
+#define RELAY_PIN 3
 #define SDA_PIN 21
 #define SCL_PIN 22
 
@@ -9,15 +9,15 @@
 #include <MFRC522.h>
 #include <SPI.h>
 #include "OTA_Update_Callback.h"
-constexpr char WIFI_SSID[] = "iPhone";
-constexpr char WIFI_PASSWORD[] = "07072004";
+constexpr char WIFI_SSID[] = "ACLAB";
+constexpr char WIFI_PASSWORD[] = "ACLAB2023";
 
 constexpr char TOKEN[] = "HFzicWqo8stiFQG6006k";
 constexpr char THINGSBOARD_SERVER[] = "app.coreiot.io";
 constexpr uint16_t THINGSBOARD_PORT = 1883U;
 
 constexpr char CURRENT_FIRMWARE_TITLE[] = "ESP32_Firmware";
-constexpr char CURRENT_FIRMWARE_VERSION[] = "1.0.0";
+constexpr char CURRENT_FIRMWARE_VERSION[]  = "1.0.0";
 
 constexpr uint32_t MAX_MESSAGE_SIZE = 1024U;
 constexpr uint32_t SERIAL_DEBUG_BAUD = 115200U;
@@ -25,6 +25,7 @@ constexpr uint32_t SERIAL_DEBUG_BAUD = 115200U;
 #define SS_PIN 10
 #define RST_PIN 9
 MFRC522 rfid(SS_PIN, RST_PIN);
+byte validUID[4] = {0xDE, 0xAD, 0xBE, 0xEF};
 
 WiFiClient wifiClient;
 Arduino_MQTT_Client mqttClient(wifiClient);
@@ -33,6 +34,16 @@ OTA_Update_Callback ota;
 float voltage = 0.0;
 float current = 0.0;
 float power = 0.0;
+
+bool isValidCard(byte *uid, byte size) {
+  if (size != 4) return false;
+  for (byte i = 0; i < 4; i++) {
+    if (uid[i] != validUID[i]) {
+      return false;
+    }
+  }
+  return true;
+}
 
 void InitWiFi() {
   Serial.println("Connecting to AP ...");
@@ -91,41 +102,37 @@ void connectTB(void *parameter) {
   }
 }
 
-String getUIDString() {
-  String uid = "";
-  for (byte i = 0; i < rfid.uid.size; i++) {
-    uid += String(rfid.uid.uidByte[i] < 0x10 ? "0" : "");
-    uid += String(rfid.uid.uidByte[i], HEX);
-  }
-  uid.toUpperCase();
-  return uid;
-}
-
 void taskRFID(void *parameter) {
   while (1) {
-    if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) {
+    if (!rfid.PICC_IsNewCardPresent()) {
       vTaskDelay(pdMS_TO_TICKS(500));
       continue;
     }
 
-    String uid = getUIDString();
-    Serial.print("Detected RFID UID: ");
-    Serial.println(uid);
-
-    // Kiểm tra UID hợp lệ (có thể thay bằng danh sách UID động)
-    if (uid == "12345678") {
-      digitalWrite(RELAY_PIN, HIGH);
-      Serial.println("Relay ON");
-      tb.sendTelemetryData("relay", true);
-    } else {
-      digitalWrite(RELAY_PIN, LOW);
-      Serial.println("Relay OFF");
-      tb.sendTelemetryData("relay", false);
+    if (!rfid.PICC_ReadCardSerial()) {
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
     }
 
-    rfid.PICC_HaltA();
-    rfid.PCD_StopCrypto1();
-    vTaskDelay(pdMS_TO_TICKS(2000));
+    Serial.print("Card UID: ");
+    for (byte i = 0; i < rfid.uid.size; i++) {
+      Serial.print(rfid.uid.uidByte[i] < 0x10 ? "0" : "");
+      Serial.print(rfid.uid.uidByte[i], HEX);
+      Serial.print(" ");
+    }
+    Serial.println();
+
+    if (isValidCard(rfid.uid.uidByte, rfid.uid.size)) {
+      Serial.println("Valid");
+      digitalWrite(RELAY_PIN, HIGH);
+      vTaskDelay(pdMS_TO_TICKS(3000));
+      digitalWrite(RELAY_PIN, LOW);
+    } else {
+      Serial.println("Invalid");
+    }
+
+    rfid.PICC_HaltA();  // Ngừng giao tiếp với thẻ
+    vTaskDelay(pdMS_TO_TICKS(1000));  // Chờ 1s trước khi đọc tiếp
   }
 }
 
@@ -188,9 +195,9 @@ void setup() {
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, LOW);
 
-  SPI.begin();
+  SPI.begin(13,12,11,10);
   rfid.PCD_Init();
-  Serial.println("RFID Ready");
+  Serial.println("RFID ready");
   Wire.begin(SDA_PIN, SCL_PIN);
   acDataMutex = xSemaphoreCreateMutex();
   InitWiFi();
@@ -202,4 +209,6 @@ void setup() {
   xTaskCreatePinnedToCore(taskSendACData, "Send AC Task", 4096, NULL, 1, NULL, 1);
 }
 
-void loop() {} 
+void loop() {
+
+} 
